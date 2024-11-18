@@ -10,6 +10,7 @@ from skrl.memories.torch import RandomMemory
 from skrl.models.torch import Model
 from skrl.multi_agents.torch.ippo import IPPO, IPPO_DEFAULT_CONFIG
 from skrl.multi_agents.torch.mappo import MAPPO, MAPPO_DEFAULT_CONFIG
+from skrl.multi_agents.torch.constraint_shared_ppo import CONSTRAINT_SHARED_PPO, CONSTRAINT_SHARED_PPO_DEFAULT_CONFIG
 from skrl.resources.preprocessors.torch import RunningStandardScaler  # noqa
 from skrl.resources.schedulers.torch import KLAdaptiveLR  # noqa
 from skrl.trainers.torch import SequentialTrainer, Trainer
@@ -43,6 +44,7 @@ class Runner:
             "ppo": PPO,
             "ippo": IPPO,
             "mappo": MAPPO,
+            "constraint_shared_ppo": CONSTRAINT_SHARED_PPO,
             # trainer
             "sequentialtrainer": SequentialTrainer,
         }
@@ -342,6 +344,21 @@ class Runner:
                 "observation_spaces": observation_spaces,
                 "action_spaces": action_spaces,
                 "shared_observation_spaces": state_spaces,
+                "possible_agents": possible_agents,
+            }
+        elif agent_class in [CONSTRAINT_SHARED_PPO]:
+            agent_cfg = CONSTRAINT_SHARED_PPO_DEFAULT_CONFIG.copy()
+            agent_cfg.update(self._process_cfg(cfg["agent"]))
+            agent_cfg["state_preprocessor_kwargs"].update({
+                agent_id: {"size": observation_spaces[agent_id], "device": device}
+                for agent_id in possible_agents
+            })
+            agent_cfg["value_preprocessor_kwargs"].update({"size": 1, "device": device})
+            agent_kwargs = {
+                "models": models,
+                "memories": memories,
+                "observation_spaces": observation_spaces,
+                "action_spaces": action_spaces,
                 "possible_agents": possible_agents,
             }
         return agent_class(cfg=agent_cfg, device=device, **agent_kwargs)
