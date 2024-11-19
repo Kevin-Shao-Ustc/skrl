@@ -104,23 +104,25 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                          action_spaces=action_spaces,
                          device=device,
                          cfg=_cfg)
-
+        # shared index for extracting the shared variables
+        self.shared_uid = next(iter(self.possible_agents))
         # models
-        self.policies = {uid: self.models[uid].get("policy", None) for uid in self.possible_agents}
-        self.values = {uid: self.models[uid].get("value", None) for uid in self.possible_agents}
-
+        # all agents share the same policy and value models
+        self.shared_policy = self.models[self.shared_uid].get("policy", None)
+        self.shared_value = self.models[self.shared_uid].get("value", None)
+        
         for uid in self.possible_agents:
             # checkpoint models
-            self.checkpoint_modules[uid]["policy"] = self.policies[uid]
-            self.checkpoint_modules[uid]["value"] = self.values[uid]
+            self.checkpoint_modules[uid]["policy"] = self.shared_policy
+            self.checkpoint_modules[uid]["value"] = self.shared_value
 
             # broadcast models' parameters in distributed runs
             if config.torch.is_distributed:
                 logger.info(f"Broadcasting models' parameters")
-                if self.policies[uid] is not None:
-                    self.policies[uid].broadcast_parameters()
-                    if self.values[uid] is not None and self.policies[uid] is not self.values[uid]:
-                        self.values[uid].broadcast_parameters()
+                if self.shared_policy is not None:
+                    self.shared_policy.broadcast_parameters()
+                    if self.shared_value is not None and self.shared_policy is not self.shared_value:
+                        self.shared_value.broadcast_parameters()
 
         # configuration
         self._learning_epochs = self._as_dict(self.cfg["learning_epochs"])
@@ -157,36 +159,28 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
         self._time_limit_bootstrap = self._as_dict(self.cfg["time_limit_bootstrap"])
 
         # set up optimizer and learning rate scheduler
-        self.optimizers = {}
-        self.schedulers = {}
+        if self.shared_policy is not None and self.shared_value is not None:
+            if self.shared_policy is self.shared_value:
+                self.shared_optimizer = torch.optim.Adam(self.shared_policy.parameters(), lr=self._learning_rate[self.shared_uid])
+            else:
+                self.shared_optimizer = torch.optim.Adam(itertools.chain(self.shared_policy.parameters(), self.shared_value.parameters()), lr=self._learning_rate[self.shared_uid])
+            self.shared_scheduler = self._learning_rate_scheduler[self.shared_uid](self.shared_optimizer, **self._learning_rate_scheduler_kwargs[self.shared_uid])
 
+        if self._state_preprocessor[self.shared_uid] is not None:
+            self.shared_state_preprocessor = self._state_preprocessor[self.shared_uid](**self._state_preprocessor_kwargs[self.shared_uid])
+            for uid in self.possible_agents:
+                self.checkpoint_modules[uid]["state_preprocessor"] = self.shared_state_preprocessor
+        else:
+            self.shared_state_preprocessor = self._empty_preprocessor
+        if self._value_preprocessor[self.shared_uid] is not None:
+            self.shared_value_preprocessor = self._value_preprocessor[self.shared_uid](**self._value_preprocessor_kwargs[self.shared_uid])
+            for uid in self.possible_agents:
+                self.checkpoint_modules[uid]["value_preprocessor"] = self.shared_value_preprocessor
+        else:
+            self.shared_value_preprocessor = self._empty_preprocessor
+        
         for uid in self.possible_agents:
-            policy = self.policies[uid]
-            value = self.values[uid]
-            if policy is not None and value is not None:
-                if policy is value:
-                    optimizer = torch.optim.Adam(policy.parameters(), lr=self._learning_rate[uid])
-                else:
-                    optimizer = torch.optim.Adam(itertools.chain(policy.parameters(), value.parameters()),
-                                                 lr=self._learning_rate[uid])
-                self.optimizers[uid] = optimizer
-                if self._learning_rate_scheduler[uid] is not None:
-                    self.schedulers[uid] = self._learning_rate_scheduler[uid](optimizer, **self._learning_rate_scheduler_kwargs[uid])
-
-            self.checkpoint_modules[uid]["optimizer"] = self.optimizers[uid]
-
-            # set up preprocessors
-            if self._state_preprocessor[uid] is not None:
-                self._state_preprocessor[uid] = self._state_preprocessor[uid](**self._state_preprocessor_kwargs[uid])
-                self.checkpoint_modules[uid]["state_preprocessor"] = self._state_preprocessor[uid]
-            else:
-                self._state_preprocessor[uid] = self._empty_preprocessor
-
-            if self._value_preprocessor[uid] is not None:
-                self._value_preprocessor[uid] = self._value_preprocessor[uid](**self._value_preprocessor_kwargs[uid])
-                self.checkpoint_modules[uid]["value_preprocessor"] = self._value_preprocessor[uid]
-            else:
-                self._value_preprocessor[uid] = self._empty_preprocessor
+            self.checkpoint_modules[uid]["optimizer"] = self.shared_optimizer
 
     def init(self, trainer_cfg: Optional[Mapping[str, Any]] = None) -> None:
         """Initialize the agent
@@ -232,7 +226,7 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
         #     return self.policy.random_act({"states": states}, role="policy")
 
         # sample stochastic actions
-        data = [self.policies[uid].act({"states": self._state_preprocessor[uid](states[uid])}, role="policy") for uid in self.possible_agents]
+        data = [self.shared_policy.act({"states": self.shared_state_preprocessor(states[uid])}, role="policy") for uid in self.possible_agents]
 
         actions = {uid: d[0] for uid, d in zip(self.possible_agents, data)}
         log_prob = {uid: d[1] for uid, d in zip(self.possible_agents, data)}
@@ -284,8 +278,8 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                     rewards[uid] = self._rewards_shaper(rewards[uid], timestep, timesteps)
 
                 # compute values
-                values, _, _ = self.values[uid].act({"states": self._state_preprocessor[uid](states[uid])}, role="value")
-                values = self._value_preprocessor[uid](values, inverse=True)
+                values, _, _ = self.shared_value.act({"states": self.shared_state_preprocessor(states[uid])}, role="value")
+                values = self.shared_value_preprocessor(values, inverse=True)
 
                 # time-limit (truncation) boostrapping
                 if self._time_limit_bootstrap[uid]:
@@ -371,45 +365,44 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
 
             return returns, advantages
 
+        policy = self.shared_policy
+        value = self.shared_value
         for uid in self.possible_agents:
-            policy = self.policies[uid]
-            value = self.values[uid]
             memory = self.memories[uid]
-
             # compute returns and advantages
             with torch.no_grad():
                 value.train(False)
-                last_values, _, _ = value.act({"states": self._state_preprocessor[uid](self._current_next_states[uid].float())}, role="value")
+                last_values, _, _ = value.act({"states": self.shared_state_preprocessor(self._current_next_states[uid].float())}, role="value")
                 value.train(True)
-            last_values = self._value_preprocessor[uid](last_values, inverse=True)
+            last_values = self.shared_value_preprocessor(last_values, inverse=True)
 
             values = memory.get_tensor_by_name("values")
             returns, advantages = compute_gae(rewards=memory.get_tensor_by_name("rewards"),
-                                              dones=memory.get_tensor_by_name("terminated"),
-                                              values=values,
-                                              next_values=last_values,
-                                              discount_factor=self._discount_factor[uid],
-                                              lambda_coefficient=self._lambda[uid])
+                                                dones=memory.get_tensor_by_name("terminated"),
+                                                values=values,
+                                                next_values=last_values,
+                                                discount_factor=self._discount_factor[self.shared_uid],
+                                                lambda_coefficient=self._lambda[self.shared_uid])
 
-            memory.set_tensor_by_name("values", self._value_preprocessor[uid](values, train=True))
-            memory.set_tensor_by_name("returns", self._value_preprocessor[uid](returns, train=True))
+            memory.set_tensor_by_name("values", self.shared_value_preprocessor(values, train=True))
+            memory.set_tensor_by_name("returns", self.shared_value_preprocessor(returns, train=True))
             memory.set_tensor_by_name("advantages", advantages)
 
             # sample mini-batches from memory
-            sampled_batches = memory.sample_all(names=self._tensors_names, mini_batches=self._mini_batches[uid])
+            sampled_batches = memory.sample_all(names=self._tensors_names, mini_batches=self._mini_batches[self.shared_uid])
 
             cumulative_policy_loss = 0
             cumulative_entropy_loss = 0
             cumulative_value_loss = 0
 
             # learning epochs
-            for epoch in range(self._learning_epochs[uid]):
+            for epoch in range(self._learning_epochs[self.shared_uid]):
                 kl_divergences = []
 
                 # mini-batches loop
                 for sampled_states, sampled_actions, sampled_log_prob, sampled_values, sampled_returns, sampled_advantages in sampled_batches:
 
-                    sampled_states = self._state_preprocessor[uid](sampled_states, train=not epoch)
+                    sampled_states = self.shared_state_preprocessor(sampled_states, train=not epoch)
 
                     _, next_log_prob, _ = policy.act({"states": sampled_states, "taken_actions": sampled_actions}, role="policy")
 
@@ -420,19 +413,19 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                         kl_divergences.append(kl_divergence)
 
                     # early stopping with KL divergence
-                    if self._kl_threshold[uid] and kl_divergence > self._kl_threshold[uid]:
+                    if self._kl_threshold[self.shared_uid] and kl_divergence > self._kl_threshold[self.shared_uid]:
                         break
 
                     # compute entropy loss
-                    if self._entropy_loss_scale[uid]:
-                        entropy_loss = -self._entropy_loss_scale[uid] * policy.get_entropy(role="policy").mean()
+                    if self._entropy_loss_scale[self.shared_uid]:
+                        entropy_loss = -self._entropy_loss_scale[self.shared_uid] * policy.get_entropy(role="policy").mean()
                     else:
                         entropy_loss = 0
 
                     # compute policy loss
                     ratio = torch.exp(next_log_prob - sampled_log_prob)
                     surrogate = sampled_advantages * ratio
-                    surrogate_clipped = sampled_advantages * torch.clip(ratio, 1.0 - self._ratio_clip[uid], 1.0 + self._ratio_clip[uid])
+                    surrogate_clipped = sampled_advantages * torch.clip(ratio, 1.0 - self._ratio_clip[self.shared_uid], 1.0 + self._ratio_clip[self.shared_uid])
 
                     policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
 
@@ -441,49 +434,50 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
 
                     if self._clip_predicted_values:
                         predicted_values = sampled_values + torch.clip(predicted_values - sampled_values,
-                                                                       min=-self._value_clip[uid],
-                                                                       max=self._value_clip[uid])
-                    value_loss = self._value_loss_scale[uid] * F.mse_loss(sampled_returns, predicted_values)
+                                                                        min=-self._value_clip[self.shared_uid],
+                                                                        max=self._value_clip[self.shared_uid])
+                    value_loss = self._value_loss_scale[self.shared_uid] * F.mse_loss(sampled_returns, predicted_values)
 
                     # optimization step
-                    self.optimizers[uid].zero_grad()
+                    self.shared_optimizer.zero_grad()
                     (policy_loss + entropy_loss + value_loss).backward()
                     if config.torch.is_distributed:
                         policy.reduce_parameters()
                         if policy is not value:
                             value.reduce_parameters()
-                    if self._grad_norm_clip[uid] > 0:
+                    if self._grad_norm_clip[self.shared_uid] > 0:
                         if policy is value:
-                            nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[uid])
+                            nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[self.shared_uid])
                         else:
-                            nn.utils.clip_grad_norm_(itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[uid])
-                    self.optimizers[uid].step()
+                            nn.utils.clip_grad_norm_(itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[self.shared_uid])
+                    self.shared_optimizer.step()
 
                     # update cumulative losses
                     cumulative_policy_loss += policy_loss.item()
                     cumulative_value_loss += value_loss.item()
-                    if self._entropy_loss_scale[uid]:
+                    if self._entropy_loss_scale[self.shared_uid]:
                         cumulative_entropy_loss += entropy_loss.item()
 
                 # update learning rate
-                if self._learning_rate_scheduler[uid]:
-                    if isinstance(self.schedulers[uid], KLAdaptiveLR):
+                if self._learning_rate_scheduler[self.shared_uid]:
+                    if isinstance(self.shared_scheduler, KLAdaptiveLR):
                         kl = torch.tensor(kl_divergences, device=self.device).mean()
                         # reduce (collect from all workers/processes) KL in distributed runs
                         if config.torch.is_distributed:
                             torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
                             kl /= config.torch.world_size
-                        self.schedulers[uid].step(kl.item())
+                        self.shared_scheduler.step(kl.item())
                     else:
-                        self.schedulers[uid].step()
+                        self.shared_scheduler.step()
 
-            # record data
-            self.track_data(f"Loss / Policy loss ({uid})", cumulative_policy_loss / (self._learning_epochs[uid] * self._mini_batches[uid]))
-            self.track_data(f"Loss / Value loss ({uid})", cumulative_value_loss / (self._learning_epochs[uid] * self._mini_batches[uid]))
-            if self._entropy_loss_scale:
-                self.track_data(f"Loss / Entropy loss ({uid})", cumulative_entropy_loss / (self._learning_epochs[uid] * self._mini_batches[uid]))
+        # record data
+        self.track_data(f"Loss / Policy loss", cumulative_policy_loss / (self._learning_epochs[self.shared_uid] * self._mini_batches[self.shared_uid]))
+        self.track_data(f"Loss / Value loss", cumulative_value_loss / (self._learning_epochs[self.shared_uid] * self._mini_batches[self.shared_uid]))
+        if self._entropy_loss_scale[self.shared_uid]:
+            self.track_data(f"Loss / Entropy loss", cumulative_entropy_loss / (self._learning_epochs[self.shared_uid] * self._mini_batches[self.shared_uid]))
 
-            self.track_data(f"Policy / Standard deviation ({uid})", policy.distribution(role="policy").stddev.mean().item())
-
-            if self._learning_rate_scheduler[uid]:
-                self.track_data(f"Learning / Learning rate ({uid})", self.schedulers[uid].get_last_lr()[0])
+        self.track_data(f"Policy / Standard deviation", policy.distribution(role="policy").stddev.mean().item())
+        
+        if self._learning_rate_scheduler[self.shared_uid]:
+            self.track_data(f"Learning / Learning rate", self.shared_scheduler.get_last_lr()[0])
+                        
