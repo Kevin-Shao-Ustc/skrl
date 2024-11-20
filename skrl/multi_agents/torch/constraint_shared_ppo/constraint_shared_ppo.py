@@ -1,3 +1,4 @@
+from random import sample
 from typing import Any, Mapping, Optional, Sequence, Union
 
 import copy
@@ -364,6 +365,8 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             return returns, advantages
+        
+        all_sampled_batches = {}
 
         policy = self.shared_policy
         value = self.shared_value
@@ -390,85 +393,111 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
 
             # sample mini-batches from memory
             sampled_batches = memory.sample_all(names=self._tensors_names, mini_batches=self._mini_batches[self.shared_uid])
+            all_sampled_batches[uid] = sampled_batches
 
-            cumulative_policy_loss = 0
-            cumulative_entropy_loss = 0
-            cumulative_value_loss = 0
+        cumulative_policy_loss = 0
+        cumulative_entropy_loss = 0
+        cumulative_value_loss = 0
 
-            # learning epochs
-            for epoch in range(self._learning_epochs[self.shared_uid]):
-                kl_divergences = []
+        # learning epochs
+        for epoch in range(self._learning_epochs[self.shared_uid]):
+            kl_divergences = []
 
-                # mini-batches loop
-                for sampled_states, sampled_actions, sampled_log_prob, sampled_values, sampled_returns, sampled_advantages in sampled_batches:
+            # mini-batches loop
+            # for sampled_states, sampled_actions, sampled_log_prob, sampled_values, sampled_returns, sampled_advantages in sampled_batches:
+            for mini_batch_idx in range(self._mini_batches[self.shared_uid]):
+                # concatenate mini-batches of all agents
+                sampled_states = []
+                sampled_actions = []
+                sampled_log_prob = []
+                sampled_values = []
+                sampled_returns = []
+                sampled_advantages = []
+                next_log_prob = []
+                predicted_values = []
+                for uid in self.possible_agents:
+                    sampled_states_uid, sampled_actions_uid, sampled_log_prob_uid, sampled_values_uid, sampled_returns_uid, sampled_advantages_uid = all_sampled_batches[uid][mini_batch_idx]
+                    sampled_states_uid = self.shared_state_preprocessor(sampled_states_uid, train=not epoch)
+                    _, next_log_prob_uid, _ = policy.act({"states": sampled_states_uid, "taken_actions": sampled_actions_uid}, role="policy")
+                    predicted_values_uid, _, _ = value.act({"states": sampled_states_uid}, role="value")
+                    sampled_states.append(sampled_states_uid)
+                    sampled_actions.append(sampled_actions_uid)
+                    sampled_log_prob.append(sampled_log_prob_uid)
+                    sampled_values.append(sampled_values_uid)
+                    sampled_returns.append(sampled_returns_uid)
+                    sampled_advantages.append(sampled_advantages_uid)
+                    next_log_prob.append(next_log_prob_uid)
+                    predicted_values.append(predicted_values_uid)
+                sampled_states = torch.cat(sampled_states, dim=0)
+                sampled_actions = torch.cat(sampled_actions, dim=0)
+                sampled_log_prob = torch.cat(sampled_log_prob, dim=0)
+                sampled_values = torch.cat(sampled_values, dim=0)
+                sampled_returns = torch.cat(sampled_returns, dim=0)
+                sampled_advantages = torch.cat(sampled_advantages, dim=0)
+                next_log_prob = torch.cat(next_log_prob, dim=0)
+                predicted_values = torch.cat(predicted_values, dim=0)
 
-                    sampled_states = self.shared_state_preprocessor(sampled_states, train=not epoch)
+                # compute approximate KL divergence
+                with torch.no_grad():
+                    ratio = next_log_prob - sampled_log_prob
+                    kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
+                    kl_divergences.append(kl_divergence)
 
-                    _, next_log_prob, _ = policy.act({"states": sampled_states, "taken_actions": sampled_actions}, role="policy")
+                # early stopping with KL divergence
+                if self._kl_threshold[self.shared_uid] and kl_divergence > self._kl_threshold[self.shared_uid]:
+                    break
 
-                    # compute approximate KL divergence
-                    with torch.no_grad():
-                        ratio = next_log_prob - sampled_log_prob
-                        kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
-                        kl_divergences.append(kl_divergence)
+                # compute entropy loss
+                if self._entropy_loss_scale[self.shared_uid]:
+                    entropy_loss = -self._entropy_loss_scale[self.shared_uid] * policy.get_entropy(role="policy").mean()
+                else:
+                    entropy_loss = 0
 
-                    # early stopping with KL divergence
-                    if self._kl_threshold[self.shared_uid] and kl_divergence > self._kl_threshold[self.shared_uid]:
-                        break
+                # compute policy loss
+                ratio = torch.exp(next_log_prob - sampled_log_prob)
+                surrogate = sampled_advantages * ratio
+                surrogate_clipped = sampled_advantages * torch.clip(ratio, 1.0 - self._ratio_clip[self.shared_uid], 1.0 + self._ratio_clip[self.shared_uid])
 
-                    # compute entropy loss
-                    if self._entropy_loss_scale[self.shared_uid]:
-                        entropy_loss = -self._entropy_loss_scale[self.shared_uid] * policy.get_entropy(role="policy").mean()
+                policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+
+                # compute value loss
+                if self._clip_predicted_values:
+                    predicted_values = sampled_values + torch.clip(predicted_values - sampled_values,
+                                                                    min=-self._value_clip[self.shared_uid],
+                                                                    max=self._value_clip[self.shared_uid])
+                value_loss = self._value_loss_scale[self.shared_uid] * F.mse_loss(sampled_returns, predicted_values)
+
+                # optimization step
+                self.shared_optimizer.zero_grad()
+                (policy_loss + entropy_loss + value_loss).backward()
+                if config.torch.is_distributed:
+                    policy.reduce_parameters()
+                    if policy is not value:
+                        value.reduce_parameters()
+                if self._grad_norm_clip[self.shared_uid] > 0:
+                    if policy is value:
+                        nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[self.shared_uid])
                     else:
-                        entropy_loss = 0
+                        nn.utils.clip_grad_norm_(itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[self.shared_uid])
+                self.shared_optimizer.step()
 
-                    # compute policy loss
-                    ratio = torch.exp(next_log_prob - sampled_log_prob)
-                    surrogate = sampled_advantages * ratio
-                    surrogate_clipped = sampled_advantages * torch.clip(ratio, 1.0 - self._ratio_clip[self.shared_uid], 1.0 + self._ratio_clip[self.shared_uid])
+                # update cumulative losses
+                cumulative_policy_loss += policy_loss.item()
+                cumulative_value_loss += value_loss.item()
+                if self._entropy_loss_scale[self.shared_uid]:
+                    cumulative_entropy_loss += entropy_loss.item()
 
-                    policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
-
-                    # compute value loss
-                    predicted_values, _, _ = value.act({"states": sampled_states}, role="value")
-
-                    if self._clip_predicted_values:
-                        predicted_values = sampled_values + torch.clip(predicted_values - sampled_values,
-                                                                        min=-self._value_clip[self.shared_uid],
-                                                                        max=self._value_clip[self.shared_uid])
-                    value_loss = self._value_loss_scale[self.shared_uid] * F.mse_loss(sampled_returns, predicted_values)
-
-                    # optimization step
-                    self.shared_optimizer.zero_grad()
-                    (policy_loss + entropy_loss + value_loss).backward()
+            # update learning rate
+            if self._learning_rate_scheduler[self.shared_uid]:
+                if isinstance(self.shared_scheduler, KLAdaptiveLR):
+                    kl = torch.tensor(kl_divergences, device=self.device).mean()
+                    # reduce (collect from all workers/processes) KL in distributed runs
                     if config.torch.is_distributed:
-                        policy.reduce_parameters()
-                        if policy is not value:
-                            value.reduce_parameters()
-                    if self._grad_norm_clip[self.shared_uid] > 0:
-                        if policy is value:
-                            nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[self.shared_uid])
-                        else:
-                            nn.utils.clip_grad_norm_(itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[self.shared_uid])
-                    self.shared_optimizer.step()
-
-                    # update cumulative losses
-                    cumulative_policy_loss += policy_loss.item()
-                    cumulative_value_loss += value_loss.item()
-                    if self._entropy_loss_scale[self.shared_uid]:
-                        cumulative_entropy_loss += entropy_loss.item()
-
-                # update learning rate
-                if self._learning_rate_scheduler[self.shared_uid]:
-                    if isinstance(self.shared_scheduler, KLAdaptiveLR):
-                        kl = torch.tensor(kl_divergences, device=self.device).mean()
-                        # reduce (collect from all workers/processes) KL in distributed runs
-                        if config.torch.is_distributed:
-                            torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
-                            kl /= config.torch.world_size
-                        self.shared_scheduler.step(kl.item())
-                    else:
-                        self.shared_scheduler.step()
+                        torch.distributed.all_reduce(kl, op=torch.distributed.ReduceOp.SUM)
+                        kl /= (config.torch.world_size * len(self.possible_agents))
+                    self.shared_scheduler.step(kl.item())
+                else:
+                    self.shared_scheduler.step()
 
         # record data
         self.track_data(f"Loss / Policy loss", cumulative_policy_loss / (self._learning_epochs[self.shared_uid] * self._mini_batches[self.shared_uid]))
