@@ -16,6 +16,20 @@ from skrl.models.torch import Model
 from skrl.multi_agents.torch import MultiAgent
 from skrl.resources.schedulers.torch import KLAdaptiveLR
 
+# Define a simple Control Barrier Function (CBF) neural network
+class CBFNetwork(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int = 64):
+        super(CBFNetwork, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)  # Output a single value B(x)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 # [start-config-dict-torch]
 CONSTRAINT_SHARED_PPO_DEFAULT_CONFIG = {
@@ -61,6 +75,19 @@ CONSTRAINT_SHARED_PPO_DEFAULT_CONFIG = {
 
         "wandb": False,             # whether to use Weights & Biases
         "wandb_kwargs": {}          # wandb kwargs (see https://docs.wandb.ai/ref/python/init)
+    },
+    # Added CBF configuration parameters
+    "cbf": {
+        "learning_rate": 1e-3,                  # CBF learning rate
+        "learning_rate_scheduler": None,        # CBF learning rate scheduler
+        "learning_rate_scheduler_kwargs": {},   # CBF learning rate scheduler's kwargs
+
+        "lambda_cbf": 0.95,      # Lambda coefficient for one-step invariance loss
+        "cbf_loss_weights": {    # Weights for each CBF loss term
+            "feasible": 1.0,
+            "infeasible": 1.0,
+            "invariance": 1.0
+        }
     }
 }
 # [end-config-dict-torch]
@@ -183,6 +210,32 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
         for uid in self.possible_agents:
             self.checkpoint_modules[uid]["optimizer"] = self.shared_optimizer
 
+        # -------------- Added: Initialize CBF Network --------------
+        # Assume observation_spaces is a dictionary and each agent has the same observation space size
+        if isinstance(self.observation_spaces[self.shared_uid], (gym.spaces.Box, gymnasium.spaces.Box)):
+            # if the observation space is a Box, the size is the shape of the Box
+            observation_space_size = self.observation_spaces[self.shared_uid].shape[0]
+        else:
+            observation_space_size = self.observation_spaces[self.shared_uid]
+        self.cbf_network = CBFNetwork(input_size=observation_space_size).to(self.device)
+        
+        # Initialize CBF optimizer
+        cbf_learning_rate = self.cfg["cbf"]["learning_rate"]
+        self.cbf_optimizer = torch.optim.Adam(self.cbf_network.parameters(), lr=cbf_learning_rate)
+        
+        # Initialize CBF learning rate scheduler if specified
+        if self.cfg["cbf"]["learning_rate_scheduler"] is not None:
+            self.cbf_scheduler = self.cfg["cbf"]["learning_rate_scheduler"](
+                self.cbf_optimizer, **self.cfg["cbf"]["learning_rate_scheduler_kwargs"]
+            )
+        else:
+            self.cbf_scheduler = None
+
+        # Get CBF lambda and loss weights
+        self.cbf_lambda = self.cfg["cbf"]["lambda_cbf"]
+        self.cbf_loss_weights = self.cfg["cbf"]["cbf_loss_weights"]
+        # -----------------------------------------------------------
+
     def init(self, trainer_cfg: Optional[Mapping[str, Any]] = None) -> None:
         """Initialize the agent
         """
@@ -200,9 +253,10 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                 self.memories[uid].create_tensor(name="values", size=1, dtype=torch.float32)
                 self.memories[uid].create_tensor(name="returns", size=1, dtype=torch.float32)
                 self.memories[uid].create_tensor(name="advantages", size=1, dtype=torch.float32)
+                self.memories[uid].create_tensor(name="next_states", size=self.observation_spaces[uid], dtype=torch.float32)
 
                 # tensors sampled during training
-                self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages"]
+                self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages", "next_states"]
 
         # create temporary variables needed for storage and computation
         self._current_log_prob = []
@@ -221,11 +275,6 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
         :return: Actions
         :rtype: torch.Tensor
         """
-        # # sample random actions
-        # # TODO: fix for stochasticity, rnn and log_prob
-        # if timestep < self._random_timesteps:
-        #     return self.policy.random_act({"states": states}, role="policy")
-
         # sample stochastic actions
         data = [self.shared_policy.act({"states": self.shared_state_preprocessor(states[uid])}, role="policy") for uid in self.possible_agents]
 
@@ -380,12 +429,15 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
             last_values = self.shared_value_preprocessor(last_values, inverse=True)
 
             values = memory.get_tensor_by_name("values")
-            returns, advantages = compute_gae(rewards=memory.get_tensor_by_name("rewards"),
-                                                dones=memory.get_tensor_by_name("terminated"),
-                                                values=values,
-                                                next_values=last_values,
-                                                discount_factor=self._discount_factor[self.shared_uid],
-                                                lambda_coefficient=self._lambda[self.shared_uid])
+            rewards = memory.get_tensor_by_name("rewards")
+            dones = memory.get_tensor_by_name("terminated")
+
+            returns, advantages = compute_gae(rewards=rewards,
+                                              dones=dones,
+                                              values=values,
+                                              next_values=last_values,
+                                              discount_factor=self._discount_factor[self.shared_uid],
+                                              lambda_coefficient=self._lambda[self.shared_uid])
 
             memory.set_tensor_by_name("values", self.shared_value_preprocessor(values, train=True))
             memory.set_tensor_by_name("returns", self.shared_value_preprocessor(returns, train=True))
@@ -403,8 +455,7 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
         for epoch in range(self._learning_epochs[self.shared_uid]):
             kl_divergences = []
 
-            # mini-batches loop
-            # for sampled_states, sampled_actions, sampled_log_prob, sampled_values, sampled_returns, sampled_advantages in sampled_batches:
+            # Mini-batches loop
             for mini_batch_idx in range(self._mini_batches[self.shared_uid]):
                 # concatenate mini-batches of all agents
                 sampled_states = []
@@ -416,7 +467,7 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                 next_log_prob = []
                 predicted_values = []
                 for uid in self.possible_agents:
-                    sampled_states_uid, sampled_actions_uid, sampled_log_prob_uid, sampled_values_uid, sampled_returns_uid, sampled_advantages_uid = all_sampled_batches[uid][mini_batch_idx]
+                    sampled_states_uid, sampled_actions_uid, sampled_log_prob_uid, sampled_values_uid, sampled_returns_uid, sampled_advantages_uid, sampled_next_states = all_sampled_batches[uid][mini_batch_idx]
                     sampled_states_uid = self.shared_state_preprocessor(sampled_states_uid, train=not epoch)
                     _, next_log_prob_uid, _ = policy.act({"states": sampled_states_uid, "taken_actions": sampled_actions_uid}, role="policy")
                     predicted_values_uid, _, _ = value.act({"states": sampled_states_uid}, role="value")
@@ -509,4 +560,74 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
         
         if self._learning_rate_scheduler[self.shared_uid]:
             self.track_data(f"Learning / Learning rate", self.shared_scheduler.get_last_lr()[0])
-                        
+
+        # -------------- Added: CBF Network Training --------------
+        if self.cbf_network is not None and self.memories:
+            cbf_loss_total = 0
+            for uid in self.possible_agents:
+                memory = self.memories[uid]
+                # Retrieve initial and unsafe states from memory
+                transition_states = memory.get_tensor_by_name("states")
+                next_transition_states = memory.get_tensor_by_name("next_states")
+                terminated = memory.get_tensor_by_name("terminated")
+                # convert into 2D tensor
+                transition_states = transition_states.view(-1, transition_states.size(-1))
+                next_transition_states = next_transition_states.view(-1, next_transition_states.size(-1))
+                terminated = terminated.view(-1)
+                # Filter out safe/init states and unsafe states
+                not_terminated = terminated.logical_not()
+                terminated_index = terminated.nonzero().view(-1)
+                not_terminated_index = not_terminated.nonzero().view(-1)
+                Dinit_states = transition_states[terminated_index]
+                Dunsafe_states = transition_states[not_terminated_index]
+                
+                # 1. Feasible Loss: B(x_init) ≤ 0
+                if Dinit_states is not None and Dinit_states.numel() > 0:
+                    B_init = self.cbf_network(Dinit_states)
+                    J_feasible = F.relu(B_init).mean()
+                else:
+                    J_feasible = torch.tensor(0.0, device=self.device)
+
+                # 2. Infeasible Loss: B(x_unsafe) > 0
+                if Dunsafe_states is not None and Dunsafe_states.numel() > 0:
+                    B_unsafe = self.cbf_network(Dunsafe_states)
+                    J_infeasible = F.relu(-B_unsafe).mean()
+                else:
+                    J_infeasible = torch.tensor(0.0, device=self.device)
+
+                # 3. One-Step Invariance Loss: B(x') - (1 - lambda) * B(x) ≤ 0
+                if transition_states is not None and next_transition_states is not None and transition_states.numel() > 0:
+                    B_x = self.cbf_network(transition_states)
+                    B_x_prime = self.cbf_network(next_transition_states)
+                    J_invariance = F.relu(B_x_prime - (1 - self.cbf_lambda) * B_x).mean()
+                else:
+                    J_invariance = torch.tensor(0.0, device=self.device)
+
+                # Total CBF loss as a weighted sum of the three loss terms
+                J_cbf = (
+                    self.cbf_loss_weights["feasible"] * J_feasible +
+                    self.cbf_loss_weights["infeasible"] * J_infeasible +
+                    self.cbf_loss_weights["invariance"] * J_invariance
+                )
+
+                cbf_loss_total += J_cbf
+
+            # Average CBF loss over all agents
+            cbf_loss_total /= len(self.possible_agents)
+
+            # Optimize CBF network
+            self.cbf_optimizer.zero_grad()
+            cbf_loss_total.backward()
+            nn.utils.clip_grad_norm_(self.cbf_network.parameters(), self._grad_norm_clip[self.shared_uid])  # Adjust gradient clipping as needed
+            self.cbf_optimizer.step()
+
+            # Update CBF learning rate scheduler if available
+            if self.cbf_scheduler is not None:
+                self.cbf_scheduler.step()
+
+            # Record CBF losses
+            self.track_data(f"Loss / CBF Feasible Loss", self.cbf_loss_weights["feasible"] * J_feasible.item())
+            self.track_data(f"Loss / CBF Infeasible Loss", self.cbf_loss_weights["infeasible"] * J_infeasible.item())
+            self.track_data(f"Loss / CBF Invariance Loss", self.cbf_loss_weights["invariance"] * J_invariance.item())
+            self.track_data(f"Loss / CBF Total Loss", cbf_loss_total.item())
+        # -----------------------------------------------------------
