@@ -16,6 +16,8 @@ from skrl.models.torch import Model
 from skrl.multi_agents.torch import MultiAgent
 from skrl.resources.schedulers.torch import KLAdaptiveLR
 
+torch.autograd.set_detect_anomaly(True)
+
 # Define a simple Control Barrier Function (CBF) neural network
 class CBFNetwork(nn.Module):
     def __init__(self, input_size: int, hidden_size: int = 64):
@@ -87,7 +89,10 @@ CONSTRAINT_SHARED_PPO_DEFAULT_CONFIG = {
             "feasible": 1.0,
             "infeasible": 1.0,
             "invariance": 1.0
-        }
+        },
+        # Added dual variable configuration
+        "dual_lr": 1e-3,          # Learning rate for dual variable
+        "dual_init": 1.0          # Initial value for dual variable
     }
 }
 # [end-config-dict-torch]
@@ -234,6 +239,15 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
         # Get CBF lambda and loss weights
         self.cbf_lambda = self.cfg["cbf"]["lambda_cbf"]
         self.cbf_loss_weights = self.cfg["cbf"]["cbf_loss_weights"]
+        # -----------------------------------------------------------
+
+        # -------------- Initialize Dual Variable --------------
+        # Define dual variable as a learnable parameter, initialized to dual_init
+        self.nu_param = nn.Parameter(torch.tensor(self.cfg["cbf"]["dual_init"], device=self.device))
+        self.nu = F.softplus(self.nu_param).detach()
+
+        # Initialize dual optimizer
+        self.dual_optimizer = torch.optim.Adam([self.nu_param], lr=self.cfg["cbf"]["dual_lr"])
         # -----------------------------------------------------------
 
     def init(self, trainer_cfg: Optional[Mapping[str, Any]] = None) -> None:
@@ -525,26 +539,6 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                                                                     max=self._value_clip[self.shared_uid])
                 value_loss = self._value_loss_scale[self.shared_uid] * F.mse_loss(sampled_returns, predicted_values)
 
-                # optimization step for PPO (policy and value)
-                self.shared_optimizer.zero_grad()
-                (policy_loss + entropy_loss + value_loss).backward()
-                if config.torch.is_distributed:
-                    policy.reduce_parameters()
-                    if policy is not value:
-                        value.reduce_parameters()
-                if self._grad_norm_clip[self.shared_uid] > 0:
-                    if policy is value:
-                        nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[self.shared_uid])
-                    else:
-                        nn.utils.clip_grad_norm_(itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[self.shared_uid])
-                self.shared_optimizer.step()
-
-                # update cumulative losses
-                cumulative_policy_loss += policy_loss.item()
-                cumulative_value_loss += value_loss.item()
-                if self._entropy_loss_scale[self.shared_uid]:
-                    cumulative_entropy_loss += entropy_loss.item()
-
                 # -------------- Integrated: CBF Network Training --------------
                 if self.cbf_network is not None and self.memories:
                     cbf_loss_total = 0
@@ -579,7 +573,7 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                         else:
                             J_infeasible = torch.tensor(0.0, device=self.device)
 
-                        # 3. One-Step Invariance Loss: B(x') - (1 - lambda) * B(x) ≤ 0
+                        # 3. Invariance Loss: B(x') - (1 - lambda) * B(x) ≤ 0
                         if transition_states is not None and next_transition_states is not None and transition_states.numel() > 0:
                             B_x = self.cbf_network(transition_states)
                             B_x_prime = self.cbf_network(next_transition_states)
@@ -601,18 +595,55 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                     cumulative_cbf_loss += cbf_loss_total.item()
                     total_cbf_steps += 1
 
-                    # Optimize CBF network
-                    self.cbf_optimizer.zero_grad()
-                    cbf_loss_total.backward()
-                    if self._grad_norm_clip[self.shared_uid] > 0:
-                        nn.utils.clip_grad_norm_(self.cbf_network.parameters(), self._grad_norm_clip[self.shared_uid])
-                    self.cbf_optimizer.step()
-
-                    # Update CBF learning rate scheduler if available
-                    if self.cbf_scheduler is not None:
-                        self.cbf_scheduler.step()
-
                 # -----------------------------------------------------------
+                
+                # ------------------ Update Dual Variable ------------------
+                # Calculate the invariant loss for dual update
+                # Assuming J_invariance has been computed above
+                dual_loss = -self.nu * ratio * J_invariance  # Negative for gradient ascent
+
+                self.dual_optimizer.zero_grad()
+                dual_loss.mean().backward(retain_graph=True)
+                self.dual_optimizer.step()
+                
+                self.nu = F.softplus(self.nu_param).detach()
+                # -----------------------------------------------------------
+
+                # -------------- Update Policy and Value Networks --------------
+                # Define total PPO loss including the dual-scaled invariance loss
+                Lagrangian_loss = policy_loss + entropy_loss + value_loss - (self.nu * ratio * J_invariance.detach()).mean()
+
+                # Optimize policy and value networks
+                self.shared_optimizer.zero_grad()
+                Lagrangian_loss.backward(retain_graph=True)
+                if config.torch.is_distributed:
+                    policy.reduce_parameters()
+                    if policy is not value:
+                        value.reduce_parameters()
+                if self._grad_norm_clip[self.shared_uid] > 0:
+                    if policy is value:
+                        nn.utils.clip_grad_norm_(policy.parameters(), self._grad_norm_clip[self.shared_uid])
+                    else:
+                        nn.utils.clip_grad_norm_(itertools.chain(policy.parameters(), value.parameters()), self._grad_norm_clip[self.shared_uid])
+                self.shared_optimizer.step()
+
+                # ------------------ Update CBF Network ------------------
+                self.cbf_optimizer.zero_grad()
+                cbf_loss_total.backward()
+                if self._grad_norm_clip[self.shared_uid] > 0:
+                    nn.utils.clip_grad_norm_(self.cbf_network.parameters(), self._grad_norm_clip[self.shared_uid])
+                self.cbf_optimizer.step()
+
+                # Update CBF learning rate scheduler if available
+                if self.cbf_scheduler is not None:
+                    self.cbf_scheduler.step()
+                # -----------------------------------------------------------
+
+                # update cumulative losses
+                cumulative_policy_loss += policy_loss.item()
+                cumulative_value_loss += value_loss.item()
+                if self._entropy_loss_scale[self.shared_uid]:
+                    cumulative_entropy_loss += entropy_loss.item()
 
             # update learning rate
             if self._learning_rate_scheduler[self.shared_uid]:
