@@ -192,7 +192,7 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                 self.shared_optimizer = torch.optim.Adam(self.shared_policy.parameters(), lr=self._learning_rate[self.shared_uid])
             else:
                 self.shared_optimizer = torch.optim.Adam(itertools.chain(self.shared_policy.parameters(), self.shared_value.parameters()), lr=self._learning_rate[self.shared_uid])
-            self.shared_scheduler = self._learning_rate_scheduler[self.shared_uid](self.shared_optimizer, **self._learning_rate_scheduler_kwargs[self.shared_uid])
+            self.shared_scheduler = self._learning_rate_scheduler[self.shared_uid](self.shared_optimizer, **self._learning_rate_scheduler_kwargs[self.shared_uid]) if self._learning_rate_scheduler[self.shared_uid] else None
 
         if self._state_preprocessor[self.shared_uid] is not None:
             self.shared_state_preprocessor = self._state_preprocessor[self.shared_uid](**self._state_preprocessor_kwargs[self.shared_uid])
@@ -210,7 +210,7 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
         for uid in self.possible_agents:
             self.checkpoint_modules[uid]["optimizer"] = self.shared_optimizer
 
-        # -------------- Added: Initialize CBF Network --------------
+        # -------------- Initialize CBF Network --------------
         # Assume observation_spaces is a dictionary and each agent has the same observation space size
         if isinstance(self.observation_spaces[self.shared_uid], (gym.spaces.Box, gymnasium.spaces.Box)):
             # if the observation space is a Box, the size is the shape of the Box
@@ -451,6 +451,12 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
 
+        # Initialize CBF loss accumulation
+        cumulative_cbf_loss = 0
+
+        # Total number of CBF steps (for averaging)
+        total_cbf_steps = 0
+
         # learning epochs
         for epoch in range(self._learning_epochs[self.shared_uid]):
             kl_divergences = []
@@ -496,6 +502,7 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
 
                 # early stopping with KL divergence
                 if self._kl_threshold[self.shared_uid] and kl_divergence > self._kl_threshold[self.shared_uid]:
+                    logger.info(f"Early stopping at epoch {epoch}, mini-batch {mini_batch_idx} due to reaching max KL.")
                     break
 
                 # compute entropy loss
@@ -518,7 +525,7 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                                                                     max=self._value_clip[self.shared_uid])
                 value_loss = self._value_loss_scale[self.shared_uid] * F.mse_loss(sampled_returns, predicted_values)
 
-                # optimization step
+                # optimization step for PPO (policy and value)
                 self.shared_optimizer.zero_grad()
                 (policy_loss + entropy_loss + value_loss).backward()
                 if config.torch.is_distributed:
@@ -538,6 +545,75 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                 if self._entropy_loss_scale[self.shared_uid]:
                     cumulative_entropy_loss += entropy_loss.item()
 
+                # -------------- Integrated: CBF Network Training --------------
+                if self.cbf_network is not None and self.memories:
+                    cbf_loss_total = 0
+                    for uid in self.possible_agents:
+                        memory = self.memories[uid]
+                        # Retrieve initial and unsafe states from memory
+                        transition_states = memory.get_tensor_by_name("states")
+                        next_transition_states = memory.get_tensor_by_name("next_states")
+                        terminated = memory.get_tensor_by_name("terminated")
+                        # convert into 2D tensor
+                        transition_states = transition_states.view(-1, transition_states.size(-1))
+                        next_transition_states = next_transition_states.view(-1, next_transition_states.size(-1))
+                        terminated = terminated.view(-1)
+                        # Filter out safe/init states and unsafe states
+                        not_terminated = terminated.logical_not()
+                        terminated_index = terminated.nonzero(as_tuple=False).squeeze(-1)
+                        not_terminated_index = not_terminated.nonzero(as_tuple=False).squeeze(-1)
+                        Dinit_states = transition_states[terminated_index] if terminated_index.numel() > 0 else None
+                        Dunsafe_states = transition_states[not_terminated_index] if not_terminated_index.numel() > 0 else None
+                        
+                        # 1. Feasible Loss: B(x_init) ≤ 0
+                        if Dinit_states is not None and Dinit_states.numel() > 0:
+                            B_init = self.cbf_network(Dinit_states)
+                            J_feasible = F.relu(B_init).mean()
+                        else:
+                            J_feasible = torch.tensor(0.0, device=self.device)
+
+                        # 2. Infeasible Loss: B(x_unsafe) > 0
+                        if Dunsafe_states is not None and Dunsafe_states.numel() > 0:
+                            B_unsafe = self.cbf_network(Dunsafe_states)
+                            J_infeasible = F.relu(-B_unsafe).mean()
+                        else:
+                            J_infeasible = torch.tensor(0.0, device=self.device)
+
+                        # 3. One-Step Invariance Loss: B(x') - (1 - lambda) * B(x) ≤ 0
+                        if transition_states is not None and next_transition_states is not None and transition_states.numel() > 0:
+                            B_x = self.cbf_network(transition_states)
+                            B_x_prime = self.cbf_network(next_transition_states)
+                            J_invariance = F.relu(B_x_prime - (1 - self.cbf_lambda) * B_x).mean()
+                        else:
+                            J_invariance = torch.tensor(0.0, device=self.device)
+
+                        # Total CBF loss as a weighted sum of the three loss terms
+                        J_cbf = (
+                            self.cbf_loss_weights["feasible"] * J_feasible +
+                            self.cbf_loss_weights["infeasible"] * J_infeasible +
+                            self.cbf_loss_weights["invariance"] * J_invariance
+                        )
+
+                        cbf_loss_total += J_cbf
+
+                    # Average CBF loss over all agents
+                    cbf_loss_total /= len(self.possible_agents)
+                    cumulative_cbf_loss += cbf_loss_total.item()
+                    total_cbf_steps += 1
+
+                    # Optimize CBF network
+                    self.cbf_optimizer.zero_grad()
+                    cbf_loss_total.backward()
+                    if self._grad_norm_clip[self.shared_uid] > 0:
+                        nn.utils.clip_grad_norm_(self.cbf_network.parameters(), self._grad_norm_clip[self.shared_uid])
+                    self.cbf_optimizer.step()
+
+                    # Update CBF learning rate scheduler if available
+                    if self.cbf_scheduler is not None:
+                        self.cbf_scheduler.step()
+
+                # -----------------------------------------------------------
+
             # update learning rate
             if self._learning_rate_scheduler[self.shared_uid]:
                 if isinstance(self.shared_scheduler, KLAdaptiveLR):
@@ -550,84 +626,20 @@ class CONSTRAINT_SHARED_PPO(MultiAgent):
                 else:
                     self.shared_scheduler.step()
 
-        # record data
-        self.track_data(f"Loss / Policy loss", cumulative_policy_loss / (self._learning_epochs[self.shared_uid] * self._mini_batches[self.shared_uid]))
-        self.track_data(f"Loss / Value loss", cumulative_value_loss / (self._learning_epochs[self.shared_uid] * self._mini_batches[self.shared_uid]))
+        # Record PPO losses
+        num_updates = self._learning_epochs[self.shared_uid] * self._mini_batches[self.shared_uid]
+        self.track_data(f"Loss / Policy loss", cumulative_policy_loss / num_updates)
+        self.track_data(f"Loss / Value loss", cumulative_value_loss / num_updates)
         if self._entropy_loss_scale[self.shared_uid]:
-            self.track_data(f"Loss / Entropy loss", cumulative_entropy_loss / (self._learning_epochs[self.shared_uid] * self._mini_batches[self.shared_uid]))
+            self.track_data(f"Loss / Entropy loss", cumulative_entropy_loss / num_updates)
 
         self.track_data(f"Policy / Standard deviation", policy.distribution(role="policy").stddev.mean().item())
         
         if self._learning_rate_scheduler[self.shared_uid]:
             self.track_data(f"Learning / Learning rate", self.shared_scheduler.get_last_lr()[0])
 
-        # -------------- Added: CBF Network Training --------------
-        if self.cbf_network is not None and self.memories:
-            cbf_loss_total = 0
-            for uid in self.possible_agents:
-                memory = self.memories[uid]
-                # Retrieve initial and unsafe states from memory
-                transition_states = memory.get_tensor_by_name("states")
-                next_transition_states = memory.get_tensor_by_name("next_states")
-                terminated = memory.get_tensor_by_name("terminated")
-                # convert into 2D tensor
-                transition_states = transition_states.view(-1, transition_states.size(-1))
-                next_transition_states = next_transition_states.view(-1, next_transition_states.size(-1))
-                terminated = terminated.view(-1)
-                # Filter out safe/init states and unsafe states
-                not_terminated = terminated.logical_not()
-                terminated_index = terminated.nonzero().view(-1)
-                not_terminated_index = not_terminated.nonzero().view(-1)
-                Dinit_states = transition_states[terminated_index]
-                Dunsafe_states = transition_states[not_terminated_index]
-                
-                # 1. Feasible Loss: B(x_init) ≤ 0
-                if Dinit_states is not None and Dinit_states.numel() > 0:
-                    B_init = self.cbf_network(Dinit_states)
-                    J_feasible = F.relu(B_init).mean()
-                else:
-                    J_feasible = torch.tensor(0.0, device=self.device)
-
-                # 2. Infeasible Loss: B(x_unsafe) > 0
-                if Dunsafe_states is not None and Dunsafe_states.numel() > 0:
-                    B_unsafe = self.cbf_network(Dunsafe_states)
-                    J_infeasible = F.relu(-B_unsafe).mean()
-                else:
-                    J_infeasible = torch.tensor(0.0, device=self.device)
-
-                # 3. One-Step Invariance Loss: B(x') - (1 - lambda) * B(x) ≤ 0
-                if transition_states is not None and next_transition_states is not None and transition_states.numel() > 0:
-                    B_x = self.cbf_network(transition_states)
-                    B_x_prime = self.cbf_network(next_transition_states)
-                    J_invariance = F.relu(B_x_prime - (1 - self.cbf_lambda) * B_x).mean()
-                else:
-                    J_invariance = torch.tensor(0.0, device=self.device)
-
-                # Total CBF loss as a weighted sum of the three loss terms
-                J_cbf = (
-                    self.cbf_loss_weights["feasible"] * J_feasible +
-                    self.cbf_loss_weights["infeasible"] * J_infeasible +
-                    self.cbf_loss_weights["invariance"] * J_invariance
-                )
-
-                cbf_loss_total += J_cbf
-
-            # Average CBF loss over all agents
-            cbf_loss_total /= len(self.possible_agents)
-
-            # Optimize CBF network
-            self.cbf_optimizer.zero_grad()
-            cbf_loss_total.backward()
-            nn.utils.clip_grad_norm_(self.cbf_network.parameters(), self._grad_norm_clip[self.shared_uid])  # Adjust gradient clipping as needed
-            self.cbf_optimizer.step()
-
-            # Update CBF learning rate scheduler if available
-            if self.cbf_scheduler is not None:
-                self.cbf_scheduler.step()
-
-            # Record CBF losses
-            self.track_data(f"Loss / CBF Feasible Loss", self.cbf_loss_weights["feasible"] * J_feasible.item())
-            self.track_data(f"Loss / CBF Infeasible Loss", self.cbf_loss_weights["infeasible"] * J_infeasible.item())
-            self.track_data(f"Loss / CBF Invariance Loss", self.cbf_loss_weights["invariance"] * J_invariance.item())
-            self.track_data(f"Loss / CBF Total Loss", cbf_loss_total.item())
+        # Record CBF losses if any updates were performed
+        if total_cbf_steps > 0:
+            avg_cbf_loss = cumulative_cbf_loss / total_cbf_steps
+            self.track_data(f"Loss / CBF Total Loss", avg_cbf_loss)
         # -----------------------------------------------------------
